@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  # SQLite version (simpler setup)
+  chat-api-sqlite:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:///./data/chat_database.db
+      - MEDIA_DIRECTORY=/app/media
+      - MAX_DATABASE_SIZE_MB=1000
+      - MAX_FILE_SIZE_MB=50
+      - API_KEY=${API_KEY:-change-this-api-key}
+    volumes:
+      - chat_data:/app/data
+      - chat_media:/app/media
+    restart: unless-stopped
+    profiles:
+      - sqlite
+    # Ensure proper user mapping for file permissions
+    user: "1000:1000"
+
+  # PostgreSQL version (production setup)
+  chat-api-postgres:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://chatuser:chatpass@postgres:5432/chatdb
+      - MEDIA_DIRECTORY=/app/media
+      - MAX_DATABASE_SIZE_MB=1000
+      - MAX_FILE_SIZE_MB=50
+      - API_KEY=${API_KEY:-change-this-api-key}
+    volumes:
+      - chat_media:/app/media
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - postgres
+    # Ensure proper user mapping for file permissions
+    user: "1000:1000"
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=chatdb
+      - POSTGRES_USER=chatuser
+      - POSTGRES_PASSWORD=chatpass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chatuser -d chatdb"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    profiles:
+      - postgres
+
+volumes:
+  chat_data:
+  chat_media:
+    # Ensure proper ownership of the media volume
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${PWD}/media_files
+  postgres_data:
