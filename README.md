@@ -137,6 +137,96 @@ These instructions will guide you through setting up and running the Boo Memorie
 *   `/stats`: Get database statistics.
 *   `/cleanup`: Trigger database cleanup based on age or size.
 
+## Testing
+
+The project includes a comprehensive test suite with 19 tests covering all major functionality. Tests are designed to run inside the Docker container to ensure consistency with the production environment.
+
+### Test Coverage
+
+- **Total Tests**: 32 ✅
+- **Test Coverage**: 51% (166/325 statements)
+- **All Tests Passing**: ✅
+
+### Covered Functionality
+
+- ✅ All API endpoints (`/health`, `/messages`, `/media`, `/stats`, `/cleanup`)
+- ✅ Message CRUD operations
+- ✅ Media upload/download functionality
+- ✅ Database operations and statistics
+- ✅ Authentication and input validation
+- ✅ Error handling for common scenarios
+
+### Running Tests
+
+#### Using Docker (Recommended)
+
+Run the complete test suite with coverage reporting inside the Docker container:
+
+```bash
+# Build the test image
+docker build -t boo-memories-test .
+
+# Run tests with coverage report
+docker run --rm boo-memories-test python tests/run_tests.py
+```
+
+This will output:
+- Test results
+- Coverage summary with missing line numbers
+- HTML coverage report (generated in container)
+
+### Test Structure
+
+```
+tests/
+├── test_main.py              # Main test suite (32 comprehensive tests)
+├── run_tests.py              # Test runner with coverage reporting
+├── test_chat_database.db     # Test database file
+├── test_media_files/         # Test media directory
+└── __pycache__/              # Python cache
+
+coverage/
+├── COVERAGE_REPORT.md        # Detailed coverage analysis
+└── htmlcov/                  # HTML coverage reports (generated)
+```
+
+### Test Categories
+
+1. **Core API Tests**
+   - Health check endpoint
+   - Message creation, retrieval, and deletion
+   - Database statistics
+
+2. **Media Handling Tests**
+   - File upload and validation
+   - Media download and streaming
+   - Media cleanup with message deletion
+
+3. **Validation & Error Handling**
+   - Input validation for all endpoints
+   - Authentication testing
+   - Error responses for invalid requests
+
+4. **Edge Cases & Advanced Features**
+   - Duplicate event ID handling
+   - Custom timestamp support
+   - Cleanup dry-run functionality
+
+### Coverage Report
+
+For detailed coverage analysis, see [`coverage/COVERAGE_REPORT.md`](coverage/COVERAGE_REPORT.md) which includes:
+- Line-by-line coverage breakdown
+- Recommendations for improving coverage
+- Analysis of covered vs uncovered functionality
+
+### Test Environment
+
+Tests use:
+- **Isolated test database**: `tests/test_chat_database.db`
+- **Separate media directory**: `tests/test_media_files/`
+- **Mocked authentication**: For consistent test execution
+- **Async test framework**: `pytest-asyncio` for proper async testing
+
 ## Technologies Used
 
 *   [FastAPI](https://fastapi.tiangolo.com/) - Web framework for building APIs
