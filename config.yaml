@@ -1,0 +1,38 @@
+# boo_memories Configuration File
+# PIN Authentication and System Configuration
+
+# PIN Authentication Configuration
+pin_auth:
+  enabled: true
+  expiry_hours: 24
+  cleanup_interval_hours: 1
+  rate_limit_per_hour: 30
+  pin_format: "6_digit_numeric"  # 000001-999999
+
+# NIST Beacon Configuration  
+nist_beacon:
+  url: "https://beacon.nist.gov/beacon/2.0/chain/last/pulse"  # Use NIST_BEACON_URL environment variable
+  timeout_seconds: 10
+  fallback_method: "secrets_randbelow"  # Use Python secrets as fallback
+
+# JWT Configuration
+jwt:
+  # If not provided, will auto-generate with secrets.token_urlsafe(32)
+  secret_key: null  
+  algorithm: "HS256"
+  access_token_expire_hours: 24
+
+# CORS Configuration (migrated from hardcoded values)
+cors:
+  allowed_origins: [] # Will use environment variable or defaults
+  development_mode: true  # Adds extra permissive origins
+
+# Database Configuration
+database:
+  max_size_mb: 1000
+  cleanup_enabled: true
+
+# Media Configuration  
+media:
+  max_file_size_mb: 50
+  directory: "./media_files"

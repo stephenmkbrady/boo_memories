@@ -29,6 +29,7 @@ python-dotenv==1.0.0
 
 # Additional utilities
 python-dateutil==2.8.2
+PyYAML==6.0.1
 
 # Testing
 pytest==7.4.0

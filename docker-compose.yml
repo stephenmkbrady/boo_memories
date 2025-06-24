@@ -5,7 +5,7 @@ services:
   chat-api-sqlite:
     build: .
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8000}:8000"
     environment:
       - DATABASE_URL=sqlite+aiosqlite:///./data/chat_database.db
       - MEDIA_DIRECTORY=/app/media
@@ -25,9 +25,9 @@ services:
   chat-api-postgres:
     build: .
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8000}:8000"
     environment:
-      - DATABASE_URL=postgresql+asyncpg://chatuser:chatpass@postgres:5432/chatdb
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://chatuser:chatpass@postgres:5432/chatdb}
       - MEDIA_DIRECTORY=/app/media
       - MAX_DATABASE_SIZE_MB=1000
       - MAX_FILE_SIZE_MB=50
@@ -46,9 +46,9 @@ services:
   postgres:
     image: postgres:15-alpine
     environment:
-      - POSTGRES_DB=chatdb
-      - POSTGRES_USER=chatuser
-      - POSTGRES_PASSWORD=chatpass
+      - POSTGRES_DB=${POSTGRES_DB:-chatdb}
+      - POSTGRES_USER=${POSTGRES_USER:-chatuser}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-chatpass}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:

@@ -17,6 +17,9 @@ from typing import Optional, List, Dict, Any
 from pathlib import Path
 import secrets
 import shutil
+import yaml
+import httpx
+from jose import JWTError, jwt
 
 # Load environment variables from .env file
 try:
@@ -43,12 +46,47 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration
+# Load configuration
+def load_config():
+    config_file = os.getenv("CONFIG_FILE", "config.yaml")
+    try:
+        with open(config_file, 'r') as f:
+            config = yaml.safe_load(f)
+        logger.info(f"✅ Loaded configuration from {config_file}")
+        return config
+    except FileNotFoundError:
+        logger.warning(f"⚠️ Config file {config_file} not found, using defaults")
+        return {}
+    except Exception as e:
+        logger.error(f"❌ Error loading config: {e}")
+        return {}
+
+config = load_config()
+
+# Configuration with YAML overrides
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./chat_database.db")
-MEDIA_DIRECTORY = os.getenv("MEDIA_DIRECTORY", "./media_files")
-MAX_DATABASE_SIZE_MB = int(os.getenv("MAX_DATABASE_SIZE_MB", "1000"))  # 1GB default
+MEDIA_DIRECTORY = os.getenv("MEDIA_DIRECTORY", config.get("media", {}).get("directory", "./media_files"))
+MAX_DATABASE_SIZE_MB = int(os.getenv("MAX_DATABASE_SIZE_MB", config.get("database", {}).get("max_size_mb", 1000)))
 API_KEY = os.getenv("API_KEY") or secrets.token_urlsafe(32)
-MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", config.get("media", {}).get("max_file_size_mb", 50)))
+
+# PIN Configuration
+PIN_CONFIG = config.get("pin_auth", {})
+PIN_ENABLED = PIN_CONFIG.get("enabled", True)
+PIN_EXPIRY_HOURS = PIN_CONFIG.get("expiry_hours", 24)
+PIN_CLEANUP_INTERVAL_HOURS = PIN_CONFIG.get("cleanup_interval_hours", 1)
+PIN_RATE_LIMIT_PER_HOUR = PIN_CONFIG.get("rate_limit_per_hour", 3)
+
+# NIST Beacon Configuration
+NIST_CONFIG = config.get("nist_beacon", {})
+NIST_BEACON_URL = NIST_CONFIG.get("url", "https://beacon.nist.gov/beacon/2.0/chain/last/pulse")
+NIST_BEACON_TIMEOUT = NIST_CONFIG.get("timeout_seconds", 10)
+
+# JWT Configuration
+JWT_CONFIG = config.get("jwt", {})
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY") or JWT_CONFIG.get("secret_key") or secrets.token_urlsafe(32)
+JWT_ALGORITHM = JWT_CONFIG.get("algorithm", "HS256")
+JWT_ACCESS_TOKEN_EXPIRE_HOURS = JWT_CONFIG.get("access_token_expire_hours", 24)
 
 # Ensure media directory exists
 Path(MEDIA_DIRECTORY).mkdir(parents=True, exist_ok=True)
@@ -58,9 +96,7 @@ Base = declarative_base()
 engine = create_async_engine(DATABASE_URL, echo=False)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-# Security
-security = HTTPBearer()
-
+# Database Models (defined early to avoid forward reference issues)
 class Message(Base):
     __tablename__ = "messages"
     
@@ -76,6 +112,17 @@ class Message(Base):
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class RoomPin(Base):
+    __tablename__ = "room_pins"
+    
+    room_id = Column(String(255), primary_key=True, index=True)
+    pin_code = Column(String(6), nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    request_count = Column(Integer, default=1)
+    last_request_at = Column(DateTime, default=datetime.utcnow)
+    nist_beacon_value = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 class DatabaseStats(Base):
     __tablename__ = "database_stats"
     
@@ -85,6 +132,182 @@ class DatabaseStats(Base):
     total_size_bytes = Column(BigInteger, default=0)
     last_cleanup = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow)
+
+# Security
+security = HTTPBearer()
+
+# PIN Management Functions
+async def fetch_nist_beacon_value() -> Optional[str]:
+    """Fetch random value from NIST beacon API for PIN generation seed"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(NIST_BEACON_URL, timeout=NIST_BEACON_TIMEOUT)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("pulse", {}).get("outputValue")
+    except Exception as e:
+        logger.warning(f"⚠️ NIST beacon failed: {e}, using fallback")
+        return None
+
+async def generate_room_pin(room_id: str, nist_value: Optional[str] = None) -> str:
+    """Generate 6-digit PIN using NIST beacon + room_id for entropy"""
+    if not nist_value:
+        nist_value = await fetch_nist_beacon_value()
+    
+    if nist_value:
+        # Use NIST beacon value + room_id for deterministic but secure PIN
+        seed_string = f"{nist_value}_{room_id}_{datetime.utcnow().strftime('%Y-%m-%d')}"
+        hash_object = hashlib.sha256(seed_string.encode())
+        hex_dig = hash_object.hexdigest()
+        pin_num = int(hex_dig[:8], 16) % 1000000
+    else:
+        # Fallback to Python secrets
+        pin_num = secrets.randbelow(1000000)
+    
+    return str(pin_num).zfill(6)
+
+async def check_pin_rate_limit(room_id: str, db: AsyncSession) -> bool:
+    """Check if room has exceeded PIN request rate limit"""
+    try:
+        from sqlalchemy import select
+        
+        # Get current room pin record
+        query = select(RoomPin).where(RoomPin.room_id == room_id)
+        result = await db.execute(query)
+        room_pin = result.scalar_one_or_none()
+        
+        if not room_pin:
+            return True  # No previous requests, allow
+        
+        # Check if within rate limit window
+        one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+        if room_pin.last_request_at < one_hour_ago:
+            # Reset counter if outside window
+            return True
+        
+        # Check rate limit
+        return room_pin.request_count < PIN_RATE_LIMIT_PER_HOUR
+        
+    except Exception as e:
+        logger.error(f"❌ Error checking rate limit: {e}")
+        return False
+
+async def get_or_create_room_pin(room_id: str, db: AsyncSession) -> RoomPin:
+    """Get current valid PIN for room or create new one"""
+    try:
+        from sqlalchemy import select, update
+        
+        # Check for existing valid PIN
+        query = select(RoomPin).where(
+            RoomPin.room_id == room_id,
+            RoomPin.expires_at > datetime.utcnow()
+        )
+        result = await db.execute(query)
+        existing_pin = result.scalar_one_or_none()
+        
+        if existing_pin:
+            # Update request count and timestamp
+            update_stmt = update(RoomPin).where(RoomPin.room_id == room_id).values(
+                request_count=RoomPin.request_count + 1,
+                last_request_at=datetime.utcnow()
+            )
+            await db.execute(update_stmt)
+            await db.commit()
+            return existing_pin
+        
+        # Create new PIN
+        nist_value = await fetch_nist_beacon_value()
+        pin_code = await generate_room_pin(room_id, nist_value)
+        expires_at = datetime.utcnow() + timedelta(hours=PIN_EXPIRY_HOURS)
+        
+        # Delete any existing expired PIN for this room
+        from sqlalchemy import delete
+        delete_stmt = delete(RoomPin).where(RoomPin.room_id == room_id)
+        await db.execute(delete_stmt)
+        
+        # Create new PIN record
+        new_pin = RoomPin(
+            room_id=room_id,
+            pin_code=pin_code,
+            expires_at=expires_at,
+            request_count=1,
+            last_request_at=datetime.utcnow(),
+            nist_beacon_value=nist_value,
+            created_at=datetime.utcnow()
+        )
+        
+        db.add(new_pin)
+        await db.commit()
+        await db.refresh(new_pin)
+        
+        logger.info(f"📌 Generated new PIN for room {room_id[:20]}... (expires: {expires_at})")
+        return new_pin
+        
+    except Exception as e:
+        logger.error(f"❌ Error managing room PIN: {e}")
+        await db.rollback()
+        raise
+
+async def validate_pin(room_id: str, pin: str, db: AsyncSession) -> bool:
+    """Validate PIN against current room PIN"""
+    try:
+        from sqlalchemy import select
+        
+        query = select(RoomPin).where(
+            RoomPin.room_id == room_id,
+            RoomPin.pin_code == pin,
+            RoomPin.expires_at > datetime.utcnow()
+        )
+        result = await db.execute(query)
+        valid_pin = result.scalar_one_or_none()
+        
+        return valid_pin is not None
+        
+    except Exception as e:
+        logger.error(f"❌ Error validating PIN: {e}")
+        return False
+
+async def create_room_access_token(room_id: str) -> str:
+    """Create JWT token with room_id claim"""
+    expires_at = datetime.utcnow() + timedelta(hours=JWT_ACCESS_TOKEN_EXPIRE_HOURS)
+    payload = {
+        "room_id": room_id,
+        "exp": expires_at,
+        "iat": datetime.utcnow(),
+        "type": "room_access"
+    }
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+async def validate_room_access_token(token: str) -> Optional[str]:
+    """Validate JWT token and return room_id"""
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "room_access":
+            return None
+        return payload.get("room_id")
+    except JWTError as e:
+        logger.warning(f"⚠️ Invalid JWT token: {e}")
+        return None
+
+async def cleanup_expired_pins(db: AsyncSession) -> int:
+    """Remove expired PINs from database"""
+    try:
+        from sqlalchemy import delete
+        
+        delete_stmt = delete(RoomPin).where(RoomPin.expires_at <= datetime.utcnow())
+        result = await db.execute(delete_stmt)
+        await db.commit()
+        
+        deleted_count = result.rowcount
+        if deleted_count > 0:
+            logger.info(f"🧹 Cleaned up {deleted_count} expired PINs")
+        
+        return deleted_count
+        
+    except Exception as e:
+        logger.error(f"❌ Error during PIN cleanup: {e}")
+        await db.rollback()
+        return 0
 
 # Pydantic models
 class MessageCreate(BaseModel):
@@ -122,6 +345,20 @@ class MediaUploadResponse(BaseModel):
     media_url: str
     message_id: int
 
+class PinRequest(BaseModel):
+    room_id: str
+    pin: str
+
+class PinResponse(BaseModel):
+    pin: str
+    expires_at: datetime
+    room_id: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    expires_at: datetime
+    room_id: str
+
 # FastAPI app
 app = FastAPI(
     title="Matrix Chat Database API",
@@ -129,21 +366,39 @@ app = FastAPI(
     version="3.0.0"
 )
 
-# Add CORS middleware AFTER app is created
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://192.168.178.28:3000,http://localhost:3001,https://dash.example.com").split(",")
+# CORS Configuration - Environment variable override or config.yaml fallback
+CORS_CONFIG = config.get("cors", {})
+DEFAULT_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:3001", 
+    "http://127.0.0.1:3000",
+    "https://dash.example.com"
+]
 
-# For development, be more permissive
-if os.getenv("ENVIRONMENT") == "development":
-    # Allow common development origins
-    ALLOWED_ORIGINS.extend([
+# Use environment variable if set, otherwise use config.yaml, otherwise use defaults
+if os.getenv("ALLOWED_ORIGINS"):
+    ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS").split(",")]
+    logger.info(f"🌐 Using CORS origins from environment variable")
+else:
+    config_origins = CORS_CONFIG.get("allowed_origins", [])
+    ALLOWED_ORIGINS = config_origins if config_origins else DEFAULT_ORIGINS
+    logger.info(f"🌐 Using CORS origins from config.yaml")
+
+# Development mode adds extra permissive origins
+if CORS_CONFIG.get("development_mode", True) or os.getenv("ENVIRONMENT") == "development":
+    development_origins = [
         "http://localhost:3000",
         "http://localhost:3001", 
         "http://127.0.0.1:3000",
         "http://192.168.178.28:3000",
-        "http://192.168.178.28:3001",
-        "https://dash.example.com"
-    ])
+        "http://192.168.178.28:3001"
+    ]
+    for origin in development_origins:
+        if origin not in ALLOWED_ORIGINS:
+            ALLOWED_ORIGINS.append(origin)
 
+# Remove duplicates while preserving order
+ALLOWED_ORIGINS = list(dict.fromkeys(ALLOWED_ORIGINS))
 print(f"🌐 CORS Allowed Origins: {ALLOWED_ORIGINS}")
 
 app.add_middleware(
@@ -178,22 +433,193 @@ async def create_tables():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+# Background PIN cleanup task
+async def periodic_pin_cleanup():
+    """Background task to cleanup expired PINs"""
+    while True:
+        try:
+            await asyncio.sleep(PIN_CLEANUP_INTERVAL_HOURS * 3600)  # Convert hours to seconds
+            async with AsyncSessionLocal() as db:
+                deleted_count = await cleanup_expired_pins(db)
+                if deleted_count > 0:
+                    logger.info(f"🧹 Background cleanup removed {deleted_count} expired PINs")
+        except Exception as e:
+            logger.error(f"❌ Background PIN cleanup error: {e}")
+            await asyncio.sleep(300)  # Wait 5 minutes before retrying
+
 @app.on_event("startup")
 async def startup_event():
     await create_tables()
+    
+    # Start background PIN cleanup task if PIN auth is enabled
+    if PIN_ENABLED:
+        asyncio.create_task(periodic_pin_cleanup())
+        logger.info(f"🧹 Started background PIN cleanup (interval: {PIN_CLEANUP_INTERVAL_HOURS}h)")
+    
     print(f"🔑 API Key: {API_KEY}")
     print(f"📁 Media Directory: {MEDIA_DIRECTORY}")
     print(f"🗄️ Database URL: {DATABASE_URL}")
-    print("✅ Simplified Database API started successfully!")
+    print(f"📌 PIN Authentication: {'Enabled' if PIN_ENABLED else 'Disabled'}")
+    print(f"🔐 JWT Secret: {JWT_SECRET_KEY[:10]}...")
+    print("✅ Database API with PIN Authentication started successfully!")
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "healthy", 
         "timestamp": datetime.utcnow(), 
-        "features": ["messages", "media", "simplified_api"],
-        "version": "3.0.0"
+        "features": ["messages", "media", "simplified_api", "pin_auth"],
+        "version": "3.0.0",
+        "pin_auth_enabled": PIN_ENABLED
     }
+
+# PIN Authentication Endpoints
+@app.post("/rooms/{room_id}/pin", response_model=PinResponse)
+async def request_room_pin(
+    room_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(verify_api_key)
+):
+    """Generate/retrieve current PIN for room (bot-only endpoint)"""
+    if not PIN_ENABLED:
+        raise HTTPException(status_code=503, detail="PIN authentication is disabled")
+    
+    try:
+        # Check rate limit
+        if not await check_pin_rate_limit(room_id, db):
+            raise HTTPException(
+                status_code=429, 
+                detail="Rate limit exceeded. Maximum 3 PIN requests per hour per room."
+            )
+        
+        # Get or create PIN
+        room_pin = await get_or_create_room_pin(room_id, db)
+        
+        logger.info(f"📌 PIN requested for room {room_id[:20]}... (requests: {room_pin.request_count})")
+        
+        return PinResponse(
+            pin=room_pin.pin_code,
+            expires_at=room_pin.expires_at,
+            room_id=room_id
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error requesting PIN for room {room_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate PIN")
+
+@app.post("/internal/auth/pin", response_model=TokenResponse)
+async def validate_pin_and_get_token(
+    pin_request: PinRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Internal endpoint: Validate PIN for web UI access"""
+    if not PIN_ENABLED:
+        raise HTTPException(status_code=503, detail="PIN authentication is disabled")
+    
+    try:
+        # Validate PIN
+        is_valid = await validate_pin(pin_request.room_id, pin_request.pin, db)
+        
+        if not is_valid:
+            raise HTTPException(
+                status_code=401, 
+                detail="Invalid PIN or PIN expired"
+            )
+        
+        # Create room access token
+        access_token = await create_room_access_token(pin_request.room_id)
+        expires_at = datetime.utcnow() + timedelta(hours=JWT_ACCESS_TOKEN_EXPIRE_HOURS)
+        
+        logger.info(f"🔑 Room access token issued for {pin_request.room_id[:20]}...")
+        
+        return TokenResponse(
+            access_token=access_token,
+            expires_at=expires_at,
+            room_id=pin_request.room_id
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error validating PIN: {e}")
+        raise HTTPException(status_code=500, detail="Failed to validate PIN")
+
+# Token validation dependency for UI endpoints
+async def verify_room_access_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify room access token and return room_id"""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="No authorization token provided")
+    
+    room_id = await validate_room_access_token(credentials.credentials)
+    if not room_id:
+        raise HTTPException(status_code=401, detail="Invalid or expired access token")
+    
+    return room_id
+
+# Web UI Proxy Endpoints (using room access tokens)
+@app.get("/ui/rooms/{room_id}/messages")
+async def get_room_messages_ui(
+    room_id: str,
+    limit: int = Query(100, description="Number of messages to return"),
+    include_media: bool = Query(False, description="Include media file information"),
+    message_type: str = Query(None, description="Filter by message type"),
+    token_room_id: str = Depends(verify_room_access_token),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get messages for specific room via UI token authentication"""
+    if token_room_id != room_id:
+        raise HTTPException(status_code=403, detail="Token not valid for this room")
+    
+    # Reuse existing message logic
+    try:
+        from sqlalchemy import select, desc
+        
+        query = select(Message).where(Message.room_id == room_id).order_by(desc(Message.timestamp)).limit(limit)
+            
+        if message_type:
+            query = query.where(Message.message_type == message_type)
+        
+        result = await db.execute(query)
+        messages = result.scalars().all()
+        
+        # Convert to dict format (same as existing endpoint)
+        message_list = []
+        for msg in messages:
+            message_dict = {
+                "id": msg.id,
+                "room_id": msg.room_id,
+                "event_id": msg.event_id,
+                "sender": msg.sender,
+                "message_type": msg.message_type,
+                "content": msg.content,
+                "timestamp": msg.timestamp,
+                "created_at": msg.created_at
+            }
+            
+            if include_media or msg.media_filename:
+                message_dict.update({
+                    "media_filename": msg.media_filename,
+                    "media_mimetype": msg.media_mimetype,
+                    "media_size_bytes": msg.media_size_bytes,
+                    "media_url": f"/media/{msg.media_filename}" if msg.media_filename else None
+                })
+            
+            message_list.append(message_dict)
+        
+        return {
+            "messages": message_list,
+            "count": len(message_list),
+            "room_id": room_id,
+            "message_type": message_type,
+            "include_media": include_media,
+            "auth_method": "room_token"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting UI messages for room {room_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve messages")
 
 # Simplified messages endpoint - no membership verification
 @app.get("/messages")
