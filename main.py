@@ -286,7 +286,9 @@ async def validate_room_access_token(token: str) -> Optional[str]:
             return None
         return payload.get("room_id")
     except JWTError as e:
-        logger.warning(f"⚠️ Invalid JWT token: {e}")
+        # Only log failed tokens with their endings to track different token sources
+        token_ending = token[-10:] if len(token) > 10 else token
+        logger.warning(f"⚠️ Invalid JWT token ending in: {token_ending} - Error: {e}")
         return None
 
 async def cleanup_expired_pins(db: AsyncSession) -> int:
@@ -620,6 +622,63 @@ async def get_room_messages_ui(
     except Exception as e:
         logger.error(f"❌ Error getting UI messages for room {room_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve messages")
+
+@app.get("/ui/rooms/{room_id}/stats")
+async def get_room_stats_ui(
+    room_id: str,
+    token_room_id: str = Depends(verify_room_access_token),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get database stats for specific room via UI token authentication"""
+    if token_room_id != room_id:
+        raise HTTPException(status_code=403, detail="Token not valid for this room")
+    
+    # Return the same stats as the main endpoint but with room context
+    try:
+        # Count total messages
+        message_count_query = select(func.count(Message.id))
+        message_count_result = await db.execute(message_count_query)
+        message_count = message_count_result.scalar() or 0
+        
+        # Count media files (messages with media_filename not null)
+        media_count_query = select(func.count(Message.id)).where(Message.media_filename.isnot(None))
+        media_count_result = await db.execute(media_count_query)
+        media_count = media_count_result.scalar() or 0
+        
+        # Count room-specific messages
+        room_message_count_query = select(func.count(Message.id)).where(Message.room_id == room_id)
+        room_message_count_result = await db.execute(room_message_count_query)
+        room_message_count = room_message_count_result.scalar() or 0
+        
+        # Get media directory size (reuse existing logic)
+        media_size = 0
+        if os.path.exists(MEDIA_DIRECTORY):
+            for root, dirs, files in os.walk(MEDIA_DIRECTORY):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    if os.path.exists(file_path):
+                        media_size += os.path.getsize(file_path)
+        
+        # Get database file size (simplified)
+        database_size = 0
+        if "sqlite" in DATABASE_URL.lower():
+            db_path = DATABASE_URL.replace("sqlite+aiosqlite:///", "").replace("./", "")
+            if os.path.exists(db_path):
+                database_size = os.path.getsize(db_path)
+        
+        return {
+            "message_count": message_count,
+            "room_message_count": room_message_count,
+            "media_count": media_count,
+            "database_size_mb": round(database_size / (1024 * 1024), 2),
+            "media_size_mb": round(media_size / (1024 * 1024), 2),
+            "room_id": room_id,
+            "auth_method": "room_token"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting UI stats for room {room_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve stats")
 
 # Simplified messages endpoint - no membership verification
 @app.get("/messages")

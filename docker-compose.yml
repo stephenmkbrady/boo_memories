@@ -6,6 +6,9 @@ services:
     build: .
     ports:
       - "${API_PORT:-8000}:8000"
+    env_file:
+      - .env
+      - ../shared/.env.secrets
     environment:
       - DATABASE_URL=sqlite+aiosqlite:///./data/chat_database.db
       - MEDIA_DIRECTORY=/app/media
@@ -26,12 +29,15 @@ services:
     build: .
     ports:
       - "${API_PORT:-8000}:8000"
+    env_file:
+      - .env
     environment:
       - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://chatuser:chatpass@postgres:5432/chatdb}
       - MEDIA_DIRECTORY=/app/media
       - MAX_DATABASE_SIZE_MB=1000
       - MAX_FILE_SIZE_MB=50
       - API_KEY=${API_KEY:-change-this-api-key}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
     volumes:
       - chat_media:/app/media
     depends_on:
