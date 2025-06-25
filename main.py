@@ -788,9 +788,36 @@ async def get_message(
         logger.error(f"❌ Error getting message {message_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve message: {str(e)}")
 
+async def verify_media_access(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify access for media downloads - supports both API keys and JWT tokens"""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="No authorization token provided")
+    
+    token = credentials.credentials
+    
+    # Try API key first (for backward compatibility)
+    if token == API_KEY:
+        logger.info(f"🔑 Media access authorized with API key")
+        return "api_key"
+    
+    # Try JWT token validation
+    room_id = await validate_room_access_token(token)
+    if room_id:
+        logger.info(f"🔑 Media access authorized with JWT token for room {room_id[:20]}...")
+        return room_id
+    
+    # If neither worked, deny access
+    raise HTTPException(
+        status_code=401, 
+        detail="Invalid authorization token - use valid API key or room access token"
+    )
+
 @app.get("/media/{filename}")
-async def download_media(filename: str):
-    """Download a media file"""
+async def download_media(
+    filename: str,
+    auth_info: str = Depends(verify_media_access)
+):
+    """Download a media file with proper authentication"""
     try:
         file_path = Path(MEDIA_DIRECTORY) / filename
         
@@ -800,6 +827,10 @@ async def download_media(filename: str):
         # Security check: ensure the file is within the media directory
         if not str(file_path.resolve()).startswith(str(Path(MEDIA_DIRECTORY).resolve())):
             raise HTTPException(status_code=403, detail="Access denied")
+        
+        # Log successful media access
+        auth_type = "API key" if auth_info == "api_key" else f"JWT token (room: {auth_info[:20]}...)"
+        logger.info(f"📁 Media download authorized: {filename} (auth: {auth_type})")
         
         return FileResponse(
             file_path, 
