@@ -66,6 +66,60 @@ services:
     profiles:
       - postgres
 
+  # Database Reset Services
+  reset-sqlite:
+    image: alpine:latest
+    command: |
+      sh -c "
+        echo '🗑️ Resetting SQLite database and media files...'
+        rm -rf /app/data/*
+        rm -rf /app/media/*
+        echo '✅ SQLite database and media files reset complete'
+      "
+    volumes:
+      - chat_data:/app/data
+      - chat_media:/app/media
+    profiles:
+      - reset-sqlite
+    restart: "no"
+
+  reset-postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-chatdb}
+      - POSTGRES_USER=${POSTGRES_USER:-chatuser}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-chatpass}
+    command: |
+      sh -c "
+        echo '🗑️ Resetting PostgreSQL database...'
+        export PGPASSWORD=$$POSTGRES_PASSWORD
+        psql -h postgres -U $$POSTGRES_USER -d postgres -c 'DROP DATABASE IF EXISTS chatdb;'
+        psql -h postgres -U $$POSTGRES_USER -d postgres -c 'CREATE DATABASE chatdb;'
+        echo '✅ PostgreSQL database reset complete'
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - reset-postgres
+    restart: "no"
+    networks:
+      - default
+
+  reset-media:
+    image: alpine:latest
+    command: |
+      sh -c "
+        echo '🗑️ Resetting media files...'
+        rm -rf /app/media/*
+        echo '✅ Media files reset complete'
+      "
+    volumes:
+      - chat_media:/app/media
+    profiles:
+      - reset-media
+    restart: "no"
+
 volumes:
   chat_data:
   chat_media:

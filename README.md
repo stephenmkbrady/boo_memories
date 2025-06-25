@@ -163,3 +163,53 @@ Frontend (PIN only) → boo_memories → JWT room token
   - Production deployment
   - Robust concurrent access
   - Automatic backups support
+
+## 🗑️ Database Reset Operations
+
+### Reset SQLite Database and Media Files
+```bash
+# Stop services first
+docker-compose --profile sqlite down
+
+# Reset SQLite database and all media files
+docker-compose --profile reset-sqlite up
+
+# Restart services
+docker-compose --profile sqlite up -d
+```
+
+### Reset PostgreSQL Database Only
+```bash
+# Stop services first
+docker-compose --profile postgres down
+
+# Reset PostgreSQL database (requires postgres service running)
+docker-compose up postgres -d
+docker-compose --profile reset-postgres up
+
+# Restart services
+docker-compose --profile postgres up -d
+```
+
+### Reset Media Files Only
+```bash
+# Reset uploaded media files without touching database
+docker-compose --profile reset-media up
+```
+
+### Complete System Reset (All Data)
+```bash
+# Reset everything - database + media files
+docker-compose down
+docker-compose --profile reset-sqlite up    # For SQLite
+# OR
+docker-compose up postgres -d && docker-compose --profile reset-postgres up  # For PostgreSQL
+
+# Clean up and restart
+docker-compose down
+docker-compose --profile <sqlite|postgres> up -d
+```
+
+**⚠️ Warning**: Reset operations permanently delete all chat messages and media files. Use with caution!
+
+**Note**: Reset services automatically exit after completion. They are designed to run once and clean up the specified data.
